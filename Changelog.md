@@ -12,10 +12,13 @@ New
 
 Bug fixes
 
+- Remove apex ZONEMD records from the input in dnst signzone. ([#164])
+
 Other changes
 
 [#61]: https://github.com/NLnetLabs/domain/pull/61
 [#147]: https://github.com/NLnetLabs/domain/pull/147
+[#164]: https://github.com/NLnetLabs/domain/pull/147
 
 ## 0.1.0-rc1 ‘Prologue’
 
