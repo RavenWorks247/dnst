@@ -7,7 +7,7 @@ dnst
 :: Domain Name System Tools - a toolset to assist DNS operators with zone and nameserver maintenance.
 
 dnst is intended to offer both:
-- a supported drop-in (see below) replacement and upgrade path for a subset of the popular NLnet Labs LDNS example tools, re-implemented in the Rust prpgramming language powered by the NLnet Labs [domain](https://github.com/NLnetLabs/domain) Rust library
+- a supported drop-in (see below) replacement and upgrade path for a subset of the popular NLnet Labs LDNS example tools, re-implemented in the Rust programming language powered by the NLnet Labs [domain](https://github.com/NLnetLabs/domain) Rust library
 - an evolving toolbox of commands to aid DNS operators in the maintenance and operation of their zones and nameservers.
 
 dnst is not intended perform dig and drill-like functions; for this NLnet Labs offers [dnsi](https://github.com/NLnetLabs/dnsi).
@@ -23,9 +23,9 @@ dnst supports two modes of operation:
 
 - key2ds
 - keygen
-- nsec3hash  
-- signzone  
-- notify  
+- nsec3hash
+- signzone
+- notify
 - update
 
 ## Installation and documentation
@@ -34,7 +34,7 @@ See https://dnst.docs.nlnetlabs.nl/.
 
 ## Compatibility with supported LDNS examples
 
-ldns mode allows for one-to-one replacement of the ldns example utilities by dnst, without having to change existing scripts. In this mode, the supported ldns examples are very closely emulated by dnst, though there are some exceptions. Please see the documentation for details. 
+ldns mode allows for one-to-one replacement of the ldns example utilities by dnst, without having to change existing scripts. In this mode, the supported ldns examples are very closely emulated by dnst, though there are some exceptions. Please see the documentation for details (differences are noted in the relevant man page).
 
 Because of a radically different achitechture and programming language, please note that the domain library is not intended as a drop-in replacement for the ldns library.
 
