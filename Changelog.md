@@ -1,20 +1,22 @@
 # Changelog
 
-## Unreleased next version
+## v0.2.0-alpha1
 
-Breaking changes
+Released 2026-03-16.
 
-New
+### Breaking changes
+
+### New
 
 - Add keyset subcommand. A DNSSEC key manager. ([#61])
 - Add find-prefix option to nsec3hash to find a label that results in an
   NSEC3 hash with a specified prefix. ([#147])
 
-Bug fixes
+### Bug fixes
 
 - Remove apex ZONEMD records from the input in dnst signzone. ([#164])
 
-Other changes
+### Other changes
 
 [#61]: https://github.com/NLnetLabs/domain/pull/61
 [#147]: https://github.com/NLnetLabs/domain/pull/147
