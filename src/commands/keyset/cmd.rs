@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
+use crate::commands::keyset::tsig::{TsigKeyName, TsigKeyStore};
 use crate::env::Env;
 use crate::error::Error;
 use crate::util;
@@ -31,6 +32,8 @@ use domain::net::client::request::{
     ComposeRequest, RequestMessage, RequestMessageMulti, SendRequest, SendRequestMulti,
 };
 use domain::net::client::stream;
+use domain::net::client::tsig::Connection as TsigConnection;
+use domain::net::client::tsig::RequestMessage as TsigRequestMessage;
 use domain::rdata::dnssec::Timestamp;
 use domain::rdata::{AllRecordData, Cdnskey, Cds, Dnskey, Ds, Rrsig, Soa, ZoneRecordData};
 use domain::resolv::lookup::lookup_host;
@@ -60,7 +63,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{absolute, Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::net::TcpStream;
 #[cfg(feature = "kmip")]
@@ -167,6 +170,10 @@ type OptDuration = Option<Duration>;
 /// Type for an optional UnixTime. A separate type is needed because CLAP
 /// treats Option<T> special.
 type OptUnixTime = Option<UnixTime>;
+
+/// Type for an optional path name. A separate type is needed because CLAP
+/// treats Option<T> special.
+type OptPathBuf = Option<PathBuf>;
 
 /// The subcommands of the keyset utility.
 #[allow(clippy::large_enum_variant)]
@@ -303,6 +310,7 @@ enum GetCommands {
 
 /// The fields that can be changed with a set command.
 #[derive(Clone, Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum SetCommands {
     /// Set the use_csk config variable.
     UseCsk {
@@ -494,6 +502,26 @@ enum SetCommands {
         args: Vec<String>,
     },
 
+    /// Set the location of the TSIG store to use to retrieve TSIG secrets
+    /// when needed.
+    TsigStorePath {
+        /// The path to the TSIG store file.
+        #[arg(value_parser = parse_opt_pathbuf)]
+        opt_path: OptPathBuf,
+    },
+
+    /// Specify a nameserver to request XFR from. If not specified the
+    /// SOA MNAME nameserver will be used.
+    PublicationNameservers {
+        /// The address and port number of the nameserver.
+        /// Optionally followed by the TSIG key name to use. The TSIG key
+        /// name is preceded by a caret (^) character.
+        ///
+        /// TsigStorePath must also have been provided and the specified
+        /// store must contain a key by this name.
+        addrs: Vec<String>,
+    },
+
     /// Set the fake time to use when signing and other time related
     /// operations.
     FakeTime {
@@ -673,6 +701,9 @@ struct WorkSpace {
     #[cfg(feature = "kmip")]
     /// The current set of KMIP server pools.
     pools: HashMap<String, SyncConnPool>,
+
+    /// A store of TSIG keys indexed by key name.
+    tsig_store: TsigKeyStore,
 }
 
 impl Keyset {
@@ -739,6 +770,8 @@ impl Keyset {
                 autoremove_delay: DEFAULT_AUTOREMOVE_DELAY,
                 update_ds_command: Vec::new(),
                 faketime: None,
+                tsig_store_path: None,
+                nameservers: HashSet::new(),
             };
 
             // Create the parent directies.
@@ -764,6 +797,7 @@ impl Keyset {
                 _locked_config_file: None,
                 #[cfg(feature = "kmip")]
                 pools: HashMap::new(),
+                tsig_store: TsigKeyStore::new(),
             };
 
             ws.write_state()?;
@@ -785,6 +819,15 @@ impl Keyset {
         let kss: KeySetState = serde_json::from_reader(file)
             .map_err(|e| format!("error loading {:?}: {e}\n", ksc.state_file))?;
 
+        let tsig_store = if let Some(path) = &ksc.tsig_store_path {
+            let store_file = file_with_write_lock(path)?;
+            let store: TsigKeyStore = serde_json::from_reader(&store_file)
+                .map_err(|e| format!("error loading {}: {e}\n", path.display()))?;
+            store
+        } else {
+            TsigKeyStore::new()
+        };
+
         let mut ws = WorkSpace {
             config: ksc,
             state: kss,
@@ -794,6 +837,7 @@ impl Keyset {
             _locked_config_file: Some(config_file),
             #[cfg(feature = "kmip")]
             pools: HashMap::new(),
+            tsig_store,
         };
 
         let now = ws.faketime_or_now();
@@ -1729,6 +1773,14 @@ struct KeySetConfig {
     ///
     /// This is needed for integration tests.
     faketime: Option<UnixTime>,
+
+    /// Path to TSIG secret store to lookup TSIG secrets when needed.
+    tsig_store_path: Option<PathBuf>,
+
+    /// Optional nameservers to request XFR from instead of the SOA MNAME
+    /// defined nameserver.
+    #[serde(default)]
+    nameservers: HashSet<NameserverConnectionDetails>,
 }
 
 /// Configuration for key roll automation.
@@ -1813,6 +1865,56 @@ impl Display for ZskRollType {
             ZskRollType::PrePublishZskRoll => write!(fmt, "pre-publish-zsk-roll"),
             ZskRollType::DoubleSignatureZskRoll => write!(fmt, "double-signature-zsk-roll"),
         }
+    }
+}
+
+/// Details needed to connect to a nameserver.
+#[derive(Debug, Deserialize, Serialize, Hash, PartialEq, Eq)]
+pub struct NameserverConnectionDetails {
+    /// The address and port number at which this nameserver accepts  DNS
+    /// requests.
+    pub addr: SocketAddr,
+
+    /// Optional TSIG key to use when communicating with this nameserver.
+    pub tsig_key_name: Option<TsigKeyName>,
+}
+
+impl From<&IpAddr> for NameserverConnectionDetails {
+    fn from(ip: &IpAddr) -> Self {
+        Self {
+            addr: SocketAddr::new(*ip, 53),
+            tsig_key_name: None,
+        }
+    }
+}
+
+impl TryFrom<&str> for NameserverConnectionDetails {
+    type Error = Error;
+
+    // Note: this only accepts IP addresses, not hostnames. In addition,
+    // a port is required, there is no default port. TODO: allow hostnames
+    // and allow the port to be optional.
+    fn try_from(s: &str) -> Result<Self, Error> {
+        let mut iter = s.split('^');
+        let Some(addr_port) = iter.next() else {
+            return Err("Address expected".into());
+        };
+        let addr = addr_port
+            .parse()
+            .map_err(|e| format!("unable to parse address {addr_port}: {e}"))?;
+
+        let tsig_key_name = match iter.next() {
+            Some(name) => Some(
+                Name::from_str(name)
+                    .map_err(|err| format!("Invalid TSIG key name '{name}': {err}"))?,
+            ),
+            None => None,
+        };
+
+        Ok(Self {
+            addr,
+            tsig_key_name,
+        })
     }
 }
 
@@ -2151,7 +2253,51 @@ impl WorkSpace {
             SetCommands::UpdateDsCommand { args } => {
                 self.config.update_ds_command = args;
             }
-            SetCommands::FakeTime { opt_unixtime } => self.config.faketime = opt_unixtime,
+            SetCommands::FakeTime { opt_unixtime } => {
+                self.config.faketime = opt_unixtime;
+            }
+            SetCommands::TsigStorePath { opt_path } => {
+                // TODO: when removing the TSIG store, check that there are
+                // no publication nameservers that reference the store.
+                self.config.tsig_store_path = opt_path;
+            }
+            SetCommands::PublicationNameservers { addrs } => {
+                let mut nameservers = HashSet::new();
+
+                for a in addrs {
+                    // When adding nameservers, check that referenced TSIG
+                    // keys are in the TSIG store.
+                    nameservers.insert(NameserverConnectionDetails::try_from(a.as_str())?);
+                }
+
+                if nameservers.iter().any(|ns| ns.tsig_key_name.is_some()) {
+                    let Some(key_store_path) = &self.config.tsig_store_path else {
+                        return Err("keyset set tsig-store-path MUST be called first".into());
+                    };
+
+                    let key_store_file = file_with_write_lock(key_store_path)?;
+                    let key_store: TsigKeyStore = serde_json::from_reader(&key_store_file)
+                        .map_err(|e| {
+                            format!("error loading {}: {e}\n", key_store_path.display())
+                        })?;
+
+                    for tsig_key_name in nameservers
+                        .iter()
+                        .filter_map(|ns| ns.tsig_key_name.as_ref())
+                    {
+                        // Verify that the key exists in the key store.
+                        if key_store.get(tsig_key_name).is_none() {
+                            return Err(format!(
+                                "No TSIG key with name '{tsig_key_name}' found in store '{}'",
+                                key_store_path.display()
+                            )
+                            .into());
+                        }
+                    }
+                }
+
+                self.config.nameservers = nameservers;
+            }
         }
         self.config_changed = true;
         Ok(())
@@ -3790,6 +3936,8 @@ impl WorkSpace {
                         report_state,
                         &mut self.state_changed,
                         now.clone(),
+                        &self.config.nameservers,
+                        &self.tsig_store,
                     )
                     .await
                     {
@@ -3858,6 +4006,8 @@ impl WorkSpace {
                         report_state,
                         &mut self.state_changed,
                         now.clone(),
+                        &self.config.nameservers,
+                        &self.tsig_store,
                     )
                     .await
                     {
@@ -4243,6 +4393,16 @@ fn parse_opt_unixtime(value: &str) -> Result<Option<UnixTime>, Error> {
     Ok(Some(unixtime))
 }
 
+/// Parse an optional PathBuf from a string but also allow 'off' to signal
+/// no PathBuf.
+fn parse_opt_pathbuf(value: &str) -> Result<Option<PathBuf>, Error> {
+    if value == "off" {
+        return Ok(None);
+    }
+    let path_buf = PathBuf::from(value);
+    Ok(Some(path_buf))
+}
+
 /// Check whether signatures need to be renewed.
 ///
 /// The input is an RRset plus signatures in zonefile format plus a
@@ -4408,6 +4568,8 @@ async fn auto_wait_actions(
     report_state: &Mutex<ReportState>,
     state_changed: &mut bool,
     now: UnixTime,
+    nameservers: &HashSet<NameserverConnectionDetails>,
+    tsig_store: &TsigKeyStore,
 ) -> AutoActionsResult {
     for a in actions {
         match a {
@@ -4602,7 +4764,7 @@ async fn auto_wait_actions(
                     }
                 }
 
-                let result = report_rrsig_propagated(state, now.clone())
+                let result = report_rrsig_propagated(state, now.clone(), nameservers, tsig_store)
                     .await
                     .unwrap_or_else(|e| {
                         warn!("Check RRSIG propagation failed: {e}");
@@ -4643,6 +4805,8 @@ async fn auto_report_actions(
     report_state: &Mutex<ReportState>,
     state_changed: &mut bool,
     now: UnixTime,
+    nameservers: &HashSet<NameserverConnectionDetails>,
+    tsig_store: &TsigKeyStore,
 ) -> AutoReportActionsResult {
     assert!(!actions.is_empty());
     let mut max_ttl = Ttl::from_secs(0);
@@ -4843,7 +5007,7 @@ async fn auto_report_actions(
                     }
                 }
 
-                let result = report_rrsig_propagated(kss, now.clone())
+                let result = report_rrsig_propagated(kss, now.clone(), nameservers, tsig_store)
                     .await
                     .unwrap_or_else(|e| {
                         warn!("Check RRSIG propagation failed: {e}");
@@ -5034,6 +5198,8 @@ async fn report_ds_propagated(
 async fn report_rrsig_propagated(
     kss: &KeySetState,
     now: UnixTime,
+    nameservers: &HashSet<NameserverConnectionDetails>,
+    tsig_store: &TsigKeyStore,
 ) -> Result<AutoReportRrsigResult, Error> {
     // This function assume a single signer. Multi-signer is not supported
     // at all, but any kind of active-passive or active-active setup would also
@@ -5043,7 +5209,7 @@ async fn report_rrsig_propagated(
     // Check the zone. If the zone checks out, make sure that all nameservers
     // have at least the version of the zone that was checked.
 
-    let result = check_zone(kss, now.clone()).await?;
+    let result = check_zone(kss, now.clone(), nameservers, tsig_store).await?;
     let (serial, ttl, report_ttl) = match result {
         // check_zone never returns Report or Wait.
         AutoReportRrsigResult::Report(_) | AutoReportRrsigResult::Wait(_) => unreachable!(),
@@ -5091,7 +5257,12 @@ async fn report_rrsig_propagated(
 /// a HashSet of type as the value. Check that each name and type has a
 /// corresponding complete RRSIG set.
 /// Ignore delegated records
-async fn check_zone(kss: &KeySetState, now: UnixTime) -> Result<AutoReportRrsigResult, Error> {
+async fn check_zone(
+    kss: &KeySetState,
+    now: UnixTime,
+    nameservers: &HashSet<NameserverConnectionDetails>,
+    tsig_store: &TsigKeyStore,
+) -> Result<AutoReportRrsigResult, Error> {
     let expected_set = get_expected_zsk_key_tags(kss);
 
     let zone = kss.keyset.name();
@@ -5115,19 +5286,60 @@ async fn check_zone(kss: &KeySetState, now: UnixTime) -> Result<AutoReportRrsigR
         };
     };
 
-    let addresses = addresses_for_name(&resolver, mname).await?;
+    // Use provided addresses and TSIG key names if available, fallback to
+    // resolving from the SOA MNAME.
+    let mname_nameservers: HashSet<NameserverConnectionDetails>;
+    let nameservers = if !nameservers.is_empty() {
+        nameservers
+    } else {
+        mname_nameservers = addresses_for_name(&resolver, mname)
+            .await?
+            .iter()
+            .map(Into::into)
+            .collect();
+        &mname_nameservers
+    };
 
-    'addr: for a in &addresses {
-        let tcp_conn = match TcpStream::connect((*a, 53_u16)).await {
+    'addr: for ns in nameservers {
+        let tcp_conn = match TcpStream::connect(ns.addr).await {
             Ok(conn) => conn,
             Err(e) => {
-                warn!("DNS TCP connection to {a} failed: {e}");
+                warn!("DNS TCP connection to {} failed: {e}", ns.addr);
                 continue;
             }
         };
 
-        let (tcp, transport) = stream::Connection::<RequestMessage<Vec<u8>>, _>::new(tcp_conn);
-        tokio::spawn(transport.run());
+        // Prepare the named TSIG key for use, if any.
+        let tsig_key = if let Some(name) = ns.tsig_key_name.as_ref() {
+            match tsig_store.get(name) {
+                Some(key) => Some(key),
+                None => {
+                    warn!("Unknown TSIG key name '{name}'");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // If we have a TSIG key, setup a TSIG capable transport, otherwise
+        // use a normal transport. Use Multi types because only those support
+        // the multiple possible responses that can occur when sending an
+        // XFR request.
+        let tcp: Box<dyn SendRequestMulti<RequestMessageMulti<Vec<u8>>>> = if let Some(tsig_key) =
+            tsig_key
+        {
+            let (conn, transport) = stream::Connection::<
+                TsigRequestMessage<RequestMessage<Vec<u8>>, Arc<domain::tsig::Key>>,
+                _,
+            >::new(tcp_conn);
+            tokio::spawn(transport.run());
+            Box::new(TsigConnection::new(tsig_key, conn))
+        } else {
+            let (conn, transport) = stream::Connection::<RequestMessage<Vec<u8>>, _>::new(tcp_conn);
+            tokio::spawn(transport.run());
+            Box::new(conn)
+        };
 
         let msg = MessageBuilder::new_vec();
         let mut msg = msg.question();
@@ -5135,7 +5347,7 @@ async fn check_zone(kss: &KeySetState, now: UnixTime) -> Result<AutoReportRrsigR
         let req = RequestMessageMulti::new(msg).expect("should not fail");
 
         // Send a request message.
-        let mut request = SendRequestMulti::send_request(&tcp, req.clone());
+        let mut request = tcp.send_request(req.clone());
 
         let mut treemap = BTreeMap::new();
         let mut sigmap = HashMap::new();
@@ -5147,7 +5359,7 @@ async fn check_zone(kss: &KeySetState, now: UnixTime) -> Result<AutoReportRrsigR
             let reply = match request.get_response().await {
                 Ok(reply) => reply,
                 Err(e) => {
-                    warn!("reading AXFR response from {a} failed: {e}");
+                    warn!("reading AXFR response from {} failed: {e}", ns.addr);
                     continue 'addr;
                 }
             };
@@ -5156,7 +5368,7 @@ async fn check_zone(kss: &KeySetState, now: UnixTime) -> Result<AutoReportRrsigR
             };
             let rcode = reply.opt_rcode();
             if rcode != OptRcode::NOERROR {
-                warn!("AXFR for {zone} from {a} failed: {rcode}");
+                warn!("AXFR for {zone} from {} failed: {rcode}", ns.addr);
                 continue 'addr;
             }
 
@@ -5222,7 +5434,7 @@ async fn check_zone(kss: &KeySetState, now: UnixTime) -> Result<AutoReportRrsigR
         }
     }
 
-    Err(format!("AXFR for {zone} failed for all addresses {addresses:?}").into())
+    Err(format!("AXFR for {zone} failed for all nameservers {nameservers:?}").into())
 }
 
 /// Return the set of addresses of the nameservers of a zone.
