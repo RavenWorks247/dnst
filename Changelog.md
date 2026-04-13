@@ -10,6 +10,12 @@
 
 ### Other changes
 
+- Add apex_remove and apex_extra fields in keyset state files. This marks
+  dnskey_rrset, cds_rrset, and ns_rrset as obsolete. They will be removed
+  when signers that use these fields have been upgraded. ([#167])
+
+[#167]: https://github.com/NLnetLabs/domain/pull/167
+
 ## v0.2.0-alpha1
 
 Released 2026-03-16.
