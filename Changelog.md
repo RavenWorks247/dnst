@@ -8,6 +8,9 @@
 
 ### Bug fixes
 
+- Use secure file permissions for key material created by `keygen` or `keyset`
+  on Linux ([#171])
+
 ### Other changes
 
 - Add apex_remove and apex_extra fields in keyset state files. This marks
@@ -15,6 +18,7 @@
   when signers that use these fields have been upgraded. ([#167])
 
 [#167]: https://github.com/NLnetLabs/domain/pull/167
+[#171]: https://github.com/NLnetLabs/domain/pull/171
 
 ## v0.2.0-alpha1
 
